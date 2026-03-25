@@ -307,21 +307,29 @@ where
         loop {
             match dev_reader.recv(&mut buf).await {
                 Ok(n) if n > 0 => {
+                    // Only forward IPv4/IPv6 packets
+                    let version = buf[0] >> 4;
+                    if version != 4 && version != 6 {
+                        debug!("tun→tls: skipping non-IP packet (version byte: {:#04x})", buf[0]);
+                        continue;
+                    }
                     count += 1;
-                    if count <= 5 || count % 100 == 0 {
-                        info!("tun→tls: {n} bytes (pkt #{count})");
+                    if count <= 20 || count % 100 == 0 {
+                        let proto = if version == 4 && n >= 10 { buf[9] } else { 0 };
+                        let proto_name = match proto { 1 => "ICMP", 6 => "TCP", 17 => "UDP", _ => "?" };
+                        info!("tun→tls: {n} bytes IPv{version} {proto_name} (pkt #{count})");
                     }
                     let len = (n as u16).to_be_bytes();
-                    if stream_writer.write_all(&len).await.is_err() {
-                        error!("tun→tls: write len failed");
+                    if let Err(e) = stream_writer.write_all(&len).await {
+                        error!("tun→tls: write len failed: {e}");
                         break;
                     }
-                    if stream_writer.write_all(&buf[..n]).await.is_err() {
-                        error!("tun→tls: write data failed");
+                    if let Err(e) = stream_writer.write_all(&buf[..n]).await {
+                        error!("tun→tls: write data failed: {e}");
                         break;
                     }
-                    if stream_writer.flush().await.is_err() {
-                        error!("tun→tls: flush failed");
+                    if let Err(e) = stream_writer.flush().await {
+                        error!("tun→tls: flush failed: {e}");
                         break;
                     }
                 }
@@ -355,8 +363,11 @@ where
                 break;
             }
             count += 1;
-            if count <= 5 || count % 100 == 0 {
-                info!("tls→tun: {len} bytes (pkt #{count})");
+            if count <= 20 || count % 100 == 0 {
+                let version = if len > 0 { buf[0] >> 4 } else { 0 };
+                let proto = if version == 4 && len >= 10 { buf[9] } else { 0 };
+                let proto_name = match proto { 1 => "ICMP", 6 => "TCP", 17 => "UDP", _ => "?" };
+                info!("tls→tun: {len} bytes IPv{version} {proto_name} (pkt #{count})");
             }
             if let Err(e) = dev_writer.send(&buf[..len]).await {
                 error!("tls→tun: TUN write failed: {e}");

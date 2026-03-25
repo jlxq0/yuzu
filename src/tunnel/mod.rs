@@ -38,16 +38,31 @@ pub fn create_device(ip: &str, prefix_len: u8, mtu: u16) -> Result<tun_rs::Async
         .build_async()
         .context("creating TUN device")?;
 
-    let name = dev.name().unwrap_or_else(|_| "utun?".into());
+    let name = dev.name().unwrap_or_else(|_| "tun?".into());
     info!("created TUN device {name} with ip {ip}/{prefix_len}, mtu {mtu}");
 
     // Bring interface up
-    Command::new("ifconfig")
-        .args([&name, "up"])
-        .status()
-        .context("ifconfig up")?;
+    if cfg!(target_os = "linux") {
+        run_cmd("ip", &["link", "set", &name, "up"])?;
+    } else {
+        Command::new("ifconfig")
+            .args([&name, "up"])
+            .status()
+            .context("ifconfig up")?;
+    }
 
     Ok(dev)
+}
+
+/// Set up point-to-point addressing on the TUN (server side)
+/// This ensures the kernel knows to route packets for the client IP through the TUN
+pub fn setup_server_tun_route(tun_name: &str, client_ip: &str) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        // On Linux, the /24 subnet route from device creation is sufficient,
+        // but explicitly add a route for the client IP to be sure
+        let _ = run_cmd("ip", &["route", "add", &format!("{client_ip}/32"), "dev", tun_name]);
+    }
+    Ok(())
 }
 
 /// Set up client-side routing: all traffic through TUN, except VPN server
@@ -185,6 +200,27 @@ pub fn teardown_server_nat() {
         // Linux: flush iptables rules (simple cleanup)
         let _ = run_cmd("iptables", &["-t", "nat", "-F"]);
         let _ = run_cmd("iptables", &["-F", "FORWARD"]);
+    }
+}
+
+/// Override DNS to use public resolvers (traffic goes through tunnel)
+pub fn setup_client_dns() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        // Back up existing resolv.conf
+        let _ = std::fs::copy("/etc/resolv.conf", "/tmp/yuzu-resolv.conf.bak");
+        std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")?;
+        info!("DNS set to 8.8.8.8 / 1.1.1.1 (through tunnel)");
+    }
+    // macOS: DNS is handled by scutil, more complex — skip for now
+    Ok(())
+}
+
+/// Restore original DNS
+pub fn teardown_client_dns() {
+    if cfg!(target_os = "linux") {
+        if let Ok(_) = std::fs::copy("/tmp/yuzu-resolv.conf.bak", "/etc/resolv.conf") {
+            info!("DNS restored");
+        }
     }
 }
 

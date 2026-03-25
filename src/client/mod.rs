@@ -54,10 +54,14 @@ pub async fn run(server: &str, secret_path: &Path, enable_camouflage: bool, inse
     // Set up routes
     tunnel::setup_client_routes(&tun_name, &server_addr)?;
 
+    // Override DNS to go through tunnel
+    tunnel::setup_client_dns()?;
+
     // Handle cleanup on shutdown
     let server_addr_cleanup = server_addr.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
+        tunnel::teardown_client_dns();
         tunnel::teardown_client_routes(&server_addr_cleanup);
         info!("client shutting down");
         std::process::exit(0);
@@ -76,6 +80,7 @@ pub async fn run(server: &str, secret_path: &Path, enable_camouflage: bool, inse
     tunnel::relay(dev, tls).await?;
 
     // If relay ends, clean up
+    tunnel::teardown_client_dns();
     tunnel::teardown_client_routes(&server_addr);
 
     Ok(())

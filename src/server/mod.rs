@@ -121,6 +121,10 @@ async fn handle_connection(
             tls.write_all(&config_buf).await?;
             tls.flush().await?;
 
+            // Ensure route to client IP exists
+            let tun_name = tun_dev.name().unwrap_or_else(|_| "tun0".into());
+            tunnel::setup_server_tun_route(&tun_name, &cfg.client_ip)?;
+
             // Relay packets
             tunnel::relay(tun_dev, tls).await?;
         }

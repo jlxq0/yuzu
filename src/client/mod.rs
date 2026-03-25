@@ -8,9 +8,9 @@ use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 /// Run the client: create TUN, route all traffic through TLS tunnel
-pub async fn run(server: &str, secret_path: &Path, enable_camouflage: bool) -> Result<()> {
+pub async fn run(server: &str, secret_path: &Path, enable_camouflage: bool, insecure: bool) -> Result<()> {
     let secret = protocol::load_secret(secret_path)?;
-    let connector = transport::tls_connector()?;
+    let connector = transport::tls_connector(insecure)?;
     let (host, port) = parse_server(server)?;
 
     info!("connecting to {host}:{port}");

@@ -94,6 +94,10 @@ enum Commands {
         /// Enable traffic camouflage (decoy HTTPS requests)
         #[arg(long)]
         camouflage: bool,
+
+        /// Skip TLS certificate verification (for self-signed certs)
+        #[arg(long)]
+        insecure: bool,
     },
 
     /// Generate a new shared secret
@@ -155,8 +159,9 @@ async fn main() -> Result<()> {
             server,
             secret,
             camouflage,
+            insecure,
         } => {
-            client::run(&server, &secret, camouflage).await?;
+            client::run(&server, &secret, camouflage, insecure).await?;
         }
         Commands::Secret => {
             let secret = protocol::generate_secret();

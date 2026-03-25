@@ -267,17 +267,25 @@ where
     // TUN → TLS
     let t2s = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
+        let mut count: u64 = 0;
         loop {
             match dev_reader.recv(&mut buf).await {
                 Ok(n) if n > 0 => {
+                    count += 1;
+                    if count <= 5 || count % 100 == 0 {
+                        info!("tun→tls: {n} bytes (pkt #{count})");
+                    }
                     let len = (n as u16).to_be_bytes();
                     if stream_writer.write_all(&len).await.is_err() {
+                        error!("tun→tls: write len failed");
                         break;
                     }
                     if stream_writer.write_all(&buf[..n]).await.is_err() {
+                        error!("tun→tls: write data failed");
                         break;
                     }
                     if stream_writer.flush().await.is_err() {
+                        error!("tun→tls: flush failed");
                         break;
                     }
                 }
@@ -293,18 +301,29 @@ where
     // TLS → TUN
     let s2t = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
+        let mut count: u64 = 0;
         loop {
             let len = match stream_reader.read_u16().await {
                 Ok(l) => l as usize,
-                Err(_) => break,
+                Err(e) => {
+                    error!("tls→tun: read len failed: {e}");
+                    break;
+                }
             };
             if len == 0 || len > 65535 {
+                error!("tls→tun: invalid len {len}");
                 break;
             }
-            if stream_reader.read_exact(&mut buf[..len]).await.is_err() {
+            if let Err(e) = stream_reader.read_exact(&mut buf[..len]).await {
+                error!("tls→tun: read data failed: {e}");
                 break;
             }
-            if dev_writer.send(&buf[..len]).await.is_err() {
+            count += 1;
+            if count <= 5 || count % 100 == 0 {
+                info!("tls→tun: {len} bytes (pkt #{count})");
+            }
+            if let Err(e) = dev_writer.send(&buf[..len]).await {
+                error!("tls→tun: TUN write failed: {e}");
                 break;
             }
         }

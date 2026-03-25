@@ -111,10 +111,14 @@ async fn handle_connection(
         // TUN mode
         tunnel::TUN_MARKER => {
             info!("client entering TUN mode");
-            // Send server TUN IP config to client
+            // Send fixed 32-byte config: [client_ip: 16 bytes, server_ip: 16 bytes]
             let cfg = tunnel::TunConfig::default();
-            let config_msg = format!("{}\n{}\n{}\n", cfg.client_ip, cfg.server_ip, cfg.prefix_len);
-            tls.write_all(config_msg.as_bytes()).await?;
+            let mut config_buf = [0u8; 32];
+            let client_bytes = cfg.client_ip.as_bytes();
+            let server_bytes = cfg.server_ip.as_bytes();
+            config_buf[..client_bytes.len()].copy_from_slice(client_bytes);
+            config_buf[16..16 + server_bytes.len()].copy_from_slice(server_bytes);
+            tls.write_all(&config_buf).await?;
             tls.flush().await?;
 
             // Relay packets

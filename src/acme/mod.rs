@@ -191,6 +191,7 @@ async fn cleanup_dns<D: DnsProvider>(record_ids: &[String], dns: &D) {
 }
 
 /// Background task: check cert expiry and renew if needed
+#[allow(dead_code)]
 pub async fn renewal_loop<D: DnsProvider>(
     domain: String,
     _state: AcmeState,

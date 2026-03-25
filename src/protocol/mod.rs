@@ -8,7 +8,7 @@ pub const SECRET_LEN: usize = 64;
 pub fn generate_secret() -> String {
     use rand::Rng;
     let bytes: [u8; 32] = rand::rng().random();
-    hex::encode(&bytes)
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Load and validate secret from file
@@ -24,34 +24,4 @@ pub fn load_secret(path: &Path) -> Result<Vec<u8>> {
         );
     }
     Ok(secret.as_bytes().to_vec())
-}
-
-/// Frame types for the tunnel protocol
-#[repr(u8)]
-pub enum FrameType {
-    /// TCP connect request: [domain_len: u8, domain: bytes, port: u16be]
-    Connect = 0x01,
-    /// TCP data
-    Data = 0x02,
-    /// Connection close
-    Close = 0x03,
-    /// UDP packet: [addr_len: u8, addr: bytes, port: u16be, data]
-    UdpPacket = 0x04,
-    /// DNS query (tunneled)
-    DnsQuery = 0x05,
-    /// DNS response
-    DnsResponse = 0x06,
-    /// Keepalive / padding
-    Ping = 0x07,
-}
-
-fn hex_encode(_bytes: &[u8]) -> String {
-    _bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-// We'll add hex as a dependency, but for now inline it
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
 }

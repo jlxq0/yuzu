@@ -67,18 +67,6 @@ enum Commands {
         /// Directory to store ACME state (account, certs)
         #[arg(long, default_value = "~/.yuzu")]
         acme_dir: String,
-
-        /// Proxy SSH connections to this address (e.g., 127.0.0.1:22)
-        #[arg(long)]
-        ssh: Option<String>,
-
-        /// Proxy ET connections to this address (e.g., 127.0.0.1:2022)
-        #[arg(long)]
-        et: Option<String>,
-
-        /// Enable traffic camouflage (decoy HTTPS on cover site)
-        #[arg(long)]
-        camouflage: bool,
     },
 
     /// Run as tunnel client (creates TUN interface, routes all traffic)
@@ -128,9 +116,6 @@ async fn main() -> Result<()> {
             acme_dns_token,
             acme_staging,
             acme_dir,
-            ssh,
-            et,
-            camouflage,
         } => {
             let (cert_path, key_path) = resolve_certs(
                 cert,
@@ -149,9 +134,6 @@ async fn main() -> Result<()> {
                 secret_path: secret,
                 cert_path,
                 key_path,
-                ssh_backend: ssh,
-                et_backend: et,
-                camouflage,
             };
             server::run(config).await?;
         }

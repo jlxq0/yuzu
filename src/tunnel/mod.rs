@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// TUN tunnel configuration
 pub struct TunConfig {
@@ -225,74 +225,8 @@ pub fn teardown_client_dns() {
     }
 }
 
-/// Relay packets between TUN device and a framed TLS stream
-///
+/// Bidirectional relay: TUN device <-> framed TLS stream
 /// Framing: each IP packet is prefixed with [len: u16 big-endian]
-pub async fn relay_tun_to_stream<S>(
-    dev: Arc<tun_rs::AsyncDevice>,
-    mut stream: S,
-) -> Result<()>
-where
-    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
-{
-    let dev_reader = dev.clone();
-    let dev_writer = dev.clone();
-
-    // TUN → TLS stream
-    let tun_to_stream = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            match dev_reader.recv(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    let len = n as u16;
-                    let mut frame = Vec::with_capacity(2 + n);
-                    frame.extend_from_slice(&len.to_be_bytes());
-                    frame.extend_from_slice(&buf[..n]);
-                    // We can't write to `stream` here because it's moved
-                    // to the other task. We need a channel.
-                    debug!("tun→stream: {n} bytes");
-                }
-                Ok(_) => continue,
-                Err(e) => {
-                    error!("TUN read error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // TLS stream → TUN
-    let stream_to_tun = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let len = match AsyncReadExt::read_u16(&mut stream).await {
-                Ok(l) => l as usize,
-                Err(_) => break,
-            };
-            if len == 0 || len > 65535 {
-                break;
-            }
-            if let Err(e) = AsyncReadExt::read_exact(&mut stream, &mut buf[..len]).await {
-                error!("stream read error: {e}");
-                break;
-            }
-            if let Err(e) = dev_writer.send(&buf[..len]).await {
-                error!("TUN write error: {e}");
-                break;
-            }
-            debug!("stream→tun: {len} bytes");
-        }
-    });
-
-    tokio::select! {
-        _ = tun_to_stream => warn!("tun→stream ended"),
-        _ = stream_to_tun => warn!("stream→tun ended"),
-    }
-
-    Ok(())
-}
-
-/// Bidirectional relay using split stream and channels
 pub async fn relay<S>(dev: Arc<tun_rs::AsyncDevice>, stream: S) -> Result<()>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
@@ -315,10 +249,8 @@ where
                         continue;
                     }
                     count += 1;
-                    if count <= 20 || count % 100 == 0 {
-                        let proto = if version == 4 && n >= 10 { buf[9] } else { 0 };
-                        let proto_name = match proto { 1 => "ICMP", 6 => "TCP", 17 => "UDP", _ => "?" };
-                        info!("tun→tls: {n} bytes IPv{version} {proto_name} (pkt #{count})");
+                    if count <= 3 || count % 1000 == 0 {
+                        debug!("tun→tls: {n} bytes (pkt #{count})");
                     }
                     let len = (n as u16).to_be_bytes();
                     if let Err(e) = stream_writer.write_all(&len).await {
@@ -364,11 +296,8 @@ where
                 break;
             }
             count += 1;
-            if count <= 20 || count % 100 == 0 {
-                let version = if len > 0 { buf[0] >> 4 } else { 0 };
-                let proto = if version == 4 && len >= 10 { buf[9] } else { 0 };
-                let proto_name = match proto { 1 => "ICMP", 6 => "TCP", 17 => "UDP", _ => "?" };
-                info!("tls→tun: {len} bytes IPv{version} {proto_name} (pkt #{count})");
+            if count <= 3 || count % 1000 == 0 {
+                debug!("tls→tun: {len} bytes (pkt #{count})");
             }
             if let Err(e) = dev_writer.send(&buf[..len]).await {
                 error!("tls→tun: TUN write failed: {e}");

@@ -96,6 +96,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 }
 
 /// Bidirectional relay between two async streams
+#[allow(dead_code)]
 pub async fn relay<A, B>(mut a: A, mut b: B) -> Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,

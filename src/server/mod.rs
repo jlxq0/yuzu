@@ -1,11 +1,11 @@
-use crate::{protocol, transport, tunnel};
+use crate::{protocol, tunnel};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct ServerConfig {
     pub listen: String,
@@ -13,9 +13,6 @@ pub struct ServerConfig {
     pub secret_path: PathBuf,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    pub ssh_backend: Option<String>,
-    pub et_backend: Option<String>,
-    pub camouflage: bool,
 }
 
 fn cover_page(domain: &str) -> String {
@@ -37,17 +34,25 @@ fn cover_page(domain: &str) -> String {
 
 pub async fn run(config: ServerConfig) -> Result<()> {
     let secret = protocol::load_secret(&config.secret_path)?;
-    let acceptor = transport::tls_acceptor(&config.cert_path, &config.key_path)?;
+    let acceptor = crate::transport::tls_acceptor(&config.cert_path, &config.key_path)?;
     let listener = TcpListener::bind(&config.listen).await?;
     let cover = cover_page(&config.domain);
 
     // Create server TUN device
     let tun_cfg = tunnel::TunConfig::default();
     let tun_dev = tunnel::create_device(&tun_cfg.server_ip, tun_cfg.prefix_len, tun_cfg.mtu)?;
-    let tun_name = tun_dev.name().unwrap_or_else(|_| "utun?".into());
+    let tun_name = tun_dev.name().unwrap_or_else(|_| "tun?".into());
 
     // Set up NAT
-    let subnet = format!("{}/{}", tun_cfg.server_ip.rsplit_once('.').map(|(base, _)| format!("{base}.0")).unwrap_or("10.66.0.0".into()), tun_cfg.prefix_len);
+    let subnet = format!(
+        "{}/{}",
+        tun_cfg
+            .server_ip
+            .rsplit_once('.')
+            .map(|(base, _)| format!("{base}.0"))
+            .unwrap_or("10.66.0.0".into()),
+        tun_cfg.prefix_len
+    );
     tunnel::setup_server_nat(&tun_name, &subnet)?;
 
     let tun_dev = Arc::new(tun_dev);
@@ -57,7 +62,6 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     info!("  tun: {tun_name} ({})", tun_cfg.server_ip);
 
     // Handle cleanup on shutdown
-    let subnet_cleanup = subnet.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tunnel::teardown_server_nat();
@@ -74,7 +78,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, &acceptor, &secret, &cover, tun).await {
-                debug!("connection from {addr}: {e}");
+                debug!("{addr}: {e}");
             }
         });
     }
@@ -99,59 +103,39 @@ async fn handle_connection(
         return serve_cover(&mut tls, cover).await;
     }
 
-    debug!("client authenticated");
-
     // Read mode byte
     let mut mode = [0u8; 1];
     if tls.read_exact(&mut mode).await.is_err() {
         return Ok(());
     }
 
-    match mode[0] {
-        // TUN mode
-        tunnel::TUN_MARKER => {
-            info!("client entering TUN mode");
-            // Send fixed 32-byte config: [client_ip: 16 bytes, server_ip: 16 bytes]
-            let cfg = tunnel::TunConfig::default();
-            let mut config_buf = [0u8; 32];
-            let client_bytes = cfg.client_ip.as_bytes();
-            let server_bytes = cfg.server_ip.as_bytes();
-            config_buf[..client_bytes.len()].copy_from_slice(client_bytes);
-            config_buf[16..16 + server_bytes.len()].copy_from_slice(server_bytes);
-            tls.write_all(&config_buf).await?;
-            tls.flush().await?;
-
-            // Ensure route to client IP exists
-            let tun_name = tun_dev.name().unwrap_or_else(|_| "tun0".into());
-            tunnel::setup_server_tun_route(&tun_name, &cfg.client_ip)?;
-
-            // Relay packets
-            tunnel::relay(tun_dev, tls).await?;
-        }
-        // SSH
-        b'S' => {
-            debug!("detected SSH");
-            let mut target = TcpStream::connect("127.0.0.1:22").await?;
-            target.write_all(&mode).await?;
-            transport::relay(tls, target).await?;
-        }
-        // ET
-        0x0a => {
-            debug!("detected ET");
-            let mut target = TcpStream::connect("127.0.0.1:2022").await?;
-            target.write_all(&mode).await?;
-            transport::relay(tls, target).await?;
-        }
-        other => {
-            warn!("unknown mode byte: {other:#04x}");
-        }
+    if mode[0] != tunnel::TUN_MARKER {
+        return serve_cover(&mut tls, cover).await;
     }
+
+    debug!("client authenticated, entering TUN mode");
+
+    // Send TUN config
+    let cfg = tunnel::TunConfig::default();
+    let mut config_buf = [0u8; 32];
+    let client_bytes = cfg.client_ip.as_bytes();
+    let server_bytes = cfg.server_ip.as_bytes();
+    config_buf[..client_bytes.len()].copy_from_slice(client_bytes);
+    config_buf[16..16 + server_bytes.len()].copy_from_slice(server_bytes);
+    tls.write_all(&config_buf).await?;
+    tls.flush().await?;
+
+    // Ensure route to client IP
+    let tun_name = tun_dev.name().unwrap_or_else(|_| "tun0".into());
+    tunnel::setup_server_tun_route(&tun_name, &cfg.client_ip)?;
+
+    // Relay packets
+    tunnel::relay(tun_dev, tls).await?;
 
     Ok(())
 }
 
 async fn serve_cover<S: AsyncWriteExt + Unpin>(stream: &mut S, cover: &str) -> Result<()> {
-    debug!("serving cover page");
     stream.write_all(cover.as_bytes()).await.ok();
     stream.shutdown().await.ok();
     Ok(())

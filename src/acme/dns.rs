@@ -138,6 +138,7 @@ impl CloudflareDns {
     /// Look up the zone ID by domain name
     pub async fn find_zone_id(api_token: &str, domain: &str) -> Result<String> {
         #[derive(Deserialize)]
+        #[allow(dead_code)]
         struct Zone {
             id: String,
             name: String,

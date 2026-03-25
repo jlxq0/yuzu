@@ -11,7 +11,7 @@ mod server;
 mod transport;
 
 #[derive(Parser)]
-#[command(name = "yuzu", version, about = "Anti-censorship tunnel")]
+#[command(name = "yuzu", version, about = "Anti-censorship tunnel. All traffic over TLS on 443.")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -66,9 +66,21 @@ enum Commands {
         /// Directory to store ACME state (account, certs)
         #[arg(long, default_value = "~/.yuzu")]
         acme_dir: String,
+
+        /// Proxy SSH connections to this address (e.g., 127.0.0.1:22)
+        #[arg(long)]
+        ssh: Option<String>,
+
+        /// Proxy ET connections to this address (e.g., 127.0.0.1:2022)
+        #[arg(long)]
+        et: Option<String>,
+
+        /// Enable traffic camouflage (decoy HTTPS on cover site)
+        #[arg(long)]
+        camouflage: bool,
     },
 
-    /// Run as tunnel client
+    /// Run as tunnel client (creates TUN interface, routes all traffic)
     Client {
         /// Server address (domain:port)
         #[arg(long)]
@@ -78,17 +90,9 @@ enum Commands {
         #[arg(long)]
         secret: PathBuf,
 
-        /// Local SOCKS5 proxy port
-        #[arg(long, default_value = "1080")]
-        socks_port: u16,
-
         /// Enable traffic camouflage (decoy HTTPS requests)
         #[arg(long)]
         camouflage: bool,
-
-        /// Tunnel DNS through the connection
-        #[arg(long)]
-        tunnel_dns: bool,
     },
 
     /// Generate a new shared secret
@@ -119,66 +123,39 @@ async fn main() -> Result<()> {
             acme_dns_token,
             acme_staging,
             acme_dir,
+            ssh,
+            et,
+            camouflage,
         } => {
-            // Resolve cert + key: either provided or via ACME
-            let (cert_path, key_path) = match (cert, key) {
-                (Some(c), Some(k)) => (c, k),
-                (None, None) => {
-                    // ACME mode
-                    let dir = acme_dir.replace('~', &std::env::var("HOME")?);
-                    let state = acme::AcmeState::new(std::path::Path::new(&dir));
+            let (cert_path, key_path) = resolve_certs(
+                cert,
+                key,
+                &domain,
+                acme_dns,
+                acme_dns_token,
+                acme_staging,
+                &acme_dir,
+            )
+            .await?;
 
-                    if state.has_valid_cert(&domain) {
-                        tracing::info!("using existing certificate");
-                        (state.cert_path(&domain), state.key_path(&domain))
-                    } else {
-                        let dns_type = acme_dns.unwrap_or_else(|| {
-                            // Try to auto-detect from env vars
-                            if std::env::var("BUNNY_API_KEY").is_ok() {
-                                DnsProviderType::Bunny
-                            } else {
-                                DnsProviderType::Cloudflare
-                            }
-                        });
-
-                        match dns_type {
-                            DnsProviderType::Bunny => {
-                                let token = acme_dns_token
-                                    .or_else(|| std::env::var("BUNNY_API_KEY").ok())
-                                    .expect("BUNNY_API_KEY or --acme-dns-token required");
-                                let zone_id =
-                                    acme::dns::BunnyDns::find_zone_id(&token, &domain).await?;
-                                let dns = acme::dns::BunnyDns::new(token, zone_id);
-                                acme::provision(&domain, &state, &dns, acme_staging).await?
-                            }
-                            DnsProviderType::Cloudflare => {
-                                let token = acme_dns_token
-                                    .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok())
-                                    .expect(
-                                        "CLOUDFLARE_API_TOKEN or --acme-dns-token required",
-                                    );
-                                let zone_id =
-                                    acme::dns::CloudflareDns::find_zone_id(&token, &domain)
-                                        .await?;
-                                let dns = acme::dns::CloudflareDns::new(token, zone_id);
-                                acme::provision(&domain, &state, &dns, acme_staging).await?
-                            }
-                        }
-                    }
-                }
-                _ => bail!("provide both --cert and --key, or neither (for ACME)"),
+            let config = server::ServerConfig {
+                listen,
+                domain,
+                secret_path: secret,
+                cert_path,
+                key_path,
+                ssh_backend: ssh,
+                et_backend: et,
+                camouflage,
             };
-
-            server::run(&listen, &domain, &secret, &cert_path, &key_path).await?;
+            server::run(config).await?;
         }
         Commands::Client {
             server,
             secret,
-            socks_port,
             camouflage,
-            tunnel_dns,
         } => {
-            client::run(&server, &secret, socks_port, camouflage, tunnel_dns).await?;
+            client::run(&server, &secret, camouflage).await?;
         }
         Commands::Secret => {
             let secret = protocol::generate_secret();
@@ -187,4 +164,57 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn resolve_certs(
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    domain: &str,
+    acme_dns: Option<DnsProviderType>,
+    acme_dns_token: Option<String>,
+    acme_staging: bool,
+    acme_dir: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    match (cert, key) {
+        (Some(c), Some(k)) => Ok((c, k)),
+        (None, None) => {
+            let dir = acme_dir.replace('~', &std::env::var("HOME")?);
+            let state = acme::AcmeState::new(std::path::Path::new(&dir));
+
+            if state.has_valid_cert(domain) {
+                tracing::info!("using existing certificate");
+                Ok((state.cert_path(domain), state.key_path(domain)))
+            } else {
+                let dns_type = acme_dns.unwrap_or_else(|| {
+                    if std::env::var("BUNNY_API_KEY").is_ok() {
+                        DnsProviderType::Bunny
+                    } else {
+                        DnsProviderType::Cloudflare
+                    }
+                });
+
+                match dns_type {
+                    DnsProviderType::Bunny => {
+                        let token = acme_dns_token
+                            .or_else(|| std::env::var("BUNNY_API_KEY").ok())
+                            .expect("BUNNY_API_KEY or --acme-dns-token required");
+                        let zone_id =
+                            acme::dns::BunnyDns::find_zone_id(&token, domain).await?;
+                        let dns = acme::dns::BunnyDns::new(token, zone_id);
+                        acme::provision(domain, &state, &dns, acme_staging).await
+                    }
+                    DnsProviderType::Cloudflare => {
+                        let token = acme_dns_token
+                            .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok())
+                            .expect("CLOUDFLARE_API_TOKEN or --acme-dns-token required");
+                        let zone_id =
+                            acme::dns::CloudflareDns::find_zone_id(&token, domain).await?;
+                        let dns = acme::dns::CloudflareDns::new(token, zone_id);
+                        acme::provision(domain, &state, &dns, acme_staging).await
+                    }
+                }
+            }
+        }
+        _ => bail!("provide both --cert and --key, or neither (for ACME)"),
+    }
 }

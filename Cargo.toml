@@ -1,0 +1,43 @@
+[package]
+name = "yuzu"
+version = "0.1.0"
+edition = "2024"
+description = "Anti-censorship tunnel. Single binary, server + client."
+license = "MIT"
+repository = "https://github.com/jlxq0/yuzu"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+# CLI + config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Crypto
+chacha20poly1305 = "0.10"
+subtle = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+blake3 = "1"
+rand = "0.9"
+
+# Networking
+bytes = "1"
+
+# HTTP (decoy traffic)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"

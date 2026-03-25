@@ -5,7 +5,11 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info};
+
+/// Maximum concurrent connections
+const MAX_CONNECTIONS: usize = 64;
 
 pub struct ServerConfig {
     pub listen: String,
@@ -16,19 +20,27 @@ pub struct ServerConfig {
 }
 
 fn cover_page(domain: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\n\
-         Server: nginx\r\n\
-         Content-Type: text/html\r\n\
-         Connection: close\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: DENY\r\n\r\n\
-         <!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+    let body = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <title>{domain}</title>\
          <style>*{{margin:0;padding:0}}body{{font-family:system-ui;background:#fafafa;\
          color:#333;display:flex;justify-content:center;align-items:center;\
          min-height:100vh}}h1{{font-size:2rem;font-weight:300}}</style>\
          </head><body><h1>{domain}</h1></body></html>"
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Server: nginx\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Referrer-Policy: strict-origin-when-cross-origin\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
     )
 }
 
@@ -37,6 +49,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let acceptor = crate::transport::tls_acceptor(&config.cert_path, &config.key_path)?;
     let listener = TcpListener::bind(&config.listen).await?;
     let cover = cover_page(&config.domain);
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     // Create server TUN device
     let tun_cfg = tunnel::TunConfig::default();
@@ -60,6 +73,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     info!("yuzu server listening on {}", config.listen);
     info!("  domain: {}", config.domain);
     info!("  tun: {tun_name} ({})", tun_cfg.server_ip);
+    info!("  max connections: {MAX_CONNECTIONS}");
 
     // Handle cleanup on shutdown
     tokio::spawn(async move {
@@ -71,6 +85,17 @@ pub async fn run(config: ServerConfig) -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+
+        // Connection limit
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("{addr}: connection limit reached, dropping");
+                drop(stream);
+                continue;
+            }
+        };
+
         let acceptor = acceptor.clone();
         let secret = secret.clone();
         let cover = cover.clone();
@@ -80,6 +105,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
             if let Err(e) = handle_connection(stream, &acceptor, &secret, &cover, tun).await {
                 debug!("{addr}: {e}");
             }
+            drop(permit); // release connection slot
         });
     }
 }
@@ -91,12 +117,25 @@ async fn handle_connection(
     cover: &str,
     tun_dev: Arc<tun_rs::AsyncDevice>,
 ) -> Result<()> {
-    let mut tls = acceptor.accept(stream).await.context("TLS handshake")?;
+    // Set a read timeout for the auth phase to prevent slowloris
+    let mut tls = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        acceptor.accept(stream),
+    )
+    .await
+    .context("TLS handshake timeout")?
+    .context("TLS handshake")?;
 
-    // Read secret
+    // Read secret with timeout
     let mut buf = vec![0u8; protocol::SECRET_LEN];
-    if tls.read_exact(&mut buf).await.is_err() {
-        return serve_cover(&mut tls, cover).await;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tls.read_exact(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        _ => return serve_cover(&mut tls, cover).await,
     }
 
     if !bool::from(buf.ct_eq(secret)) {

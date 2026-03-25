@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -185,7 +185,7 @@ async fn resolve_certs(
                     DnsProviderType::Bunny => {
                         let token = acme_dns_token
                             .or_else(|| std::env::var("BUNNY_API_KEY").ok())
-                            .expect("BUNNY_API_KEY or --acme-dns-token required");
+                            .context("set BUNNY_API_KEY or use --acme-dns-token")?;
                         let zone_id =
                             acme::dns::BunnyDns::find_zone_id(&token, domain).await?;
                         let dns = acme::dns::BunnyDns::new(token, zone_id);
@@ -194,7 +194,7 @@ async fn resolve_certs(
                     DnsProviderType::Cloudflare => {
                         let token = acme_dns_token
                             .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok())
-                            .expect("CLOUDFLARE_API_TOKEN or --acme-dns-token required");
+                            .context("set CLOUDFLARE_API_TOKEN or use --acme-dns-token")?;
                         let zone_id =
                             acme::dns::CloudflareDns::find_zone_id(&token, domain).await?;
                         let dns = acme::dns::CloudflareDns::new(token, zone_id);

@@ -17,7 +17,8 @@ pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)?.expect("no private key found");
+    let key = rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in PEM file"))?;
     Ok(key)
 }
 

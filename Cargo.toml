@@ -22,11 +22,12 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 # Crypto
-chacha20poly1305 = "0.10"
 subtle = "2"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-blake3 = "1"
 rand = "0.9"
+# Inner AEAD layer (planned):
+# chacha20poly1305 = "0.10"
+# x25519-dalek = { version = "2", features = ["static_secrets"] }
+# blake3 = "1"
 
 # Networking
 bytes = "1"

@@ -101,7 +101,6 @@ fn setup_routes_linux(tun_name: &str, server_ip: &str) -> Result<()> {
         .output()
         .context("getting default gateway")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // "default via 172.31.1.1 dev eth0"
     let gateway = stdout
         .split_whitespace()
         .skip_while(|w| *w != "via")
@@ -113,7 +112,12 @@ fn setup_routes_linux(tun_name: &str, server_ip: &str) -> Result<()> {
     run_cmd("ip", &["route", "add", server_ip, "via", &gateway])?;
     run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name])?;
     run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name])?;
-    info!("routes configured: all traffic → {tun_name}");
+
+    // Block IPv6 to prevent leaks
+    let _ = run_cmd("sysctl", &["-w", "net.ipv6.conf.all.disable_ipv6=1"]);
+    let _ = run_cmd("sysctl", &["-w", "net.ipv6.conf.default.disable_ipv6=1"]);
+
+    info!("routes configured: all traffic → {tun_name} (IPv6 disabled)");
     Ok(())
 }
 
@@ -127,6 +131,9 @@ pub fn teardown_client_routes(server_ip: &str) {
         let _ = run_cmd("ip", &["route", "del", "0.0.0.0/1"]);
         let _ = run_cmd("ip", &["route", "del", "128.0.0.0/1"]);
         let _ = run_cmd("ip", &["route", "del", server_ip]);
+        // Re-enable IPv6
+        let _ = run_cmd("sysctl", &["-w", "net.ipv6.conf.all.disable_ipv6=0"]);
+        let _ = run_cmd("sysctl", &["-w", "net.ipv6.conf.default.disable_ipv6=0"]);
     }
     info!("routes cleaned up");
 }
@@ -242,6 +249,11 @@ where
         loop {
             match dev_reader.recv(&mut buf).await {
                 Ok(n) if n > 0 => {
+                    // Guard against u16 overflow
+                    if n > u16::MAX as usize {
+                        error!("packet too large: {n} bytes, skipping");
+                        continue;
+                    }
                     // Only forward IPv4/IPv6 packets
                     let version = buf[0] >> 4;
                     if version != 4 && version != 6 {

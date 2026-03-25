@@ -18,6 +18,10 @@ pub async fn run(
     let connector = transport::tls_connector(insecure)?;
     let (host, port) = parse_server(server)?;
 
+    if insecure {
+        warn!("WARNING: --insecure disables ALL TLS certificate verification. Vulnerable to MITM.");
+    }
+
     // Resolve server IP before creating TUN (DNS won't work after route change)
     let server_addr = dns_resolve(&host).await?;
     info!("server resolved to {server_addr}");
@@ -55,7 +59,18 @@ pub async fn run(
     // Handle cleanup on shutdown
     let server_addr_cleanup = server_addr.clone();
     tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
         tokio::signal::ctrl_c().await.ok();
+
         tunnel::teardown_client_dns();
         tunnel::teardown_client_routes(&server_addr_cleanup);
         info!("shutting down");

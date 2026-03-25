@@ -52,7 +52,14 @@ pub fn create_device(ip: &str, prefix_len: u8, mtu: u16) -> Result<tun_rs::Async
 
 /// Set up client-side routing: all traffic through TUN, except VPN server
 pub fn setup_client_routes(tun_name: &str, server_ip: &str) -> Result<()> {
-    // Find the current default gateway
+    if cfg!(target_os = "macos") {
+        setup_routes_macos(tun_name, server_ip)
+    } else {
+        setup_routes_linux(tun_name, server_ip)
+    }
+}
+
+fn setup_routes_macos(tun_name: &str, server_ip: &str) -> Result<()> {
     let output = Command::new("route")
         .args(["-n", "get", "default"])
         .output()
@@ -66,32 +73,86 @@ pub fn setup_client_routes(tun_name: &str, server_ip: &str) -> Result<()> {
         .context("parsing default gateway")?;
 
     info!("original gateway: {gateway}");
-
-    // Route VPN server traffic through original gateway (avoid loop)
     run_cmd("route", &["add", "-host", server_ip, &gateway])?;
-
-    // Route everything else through TUN (0/1 + 128/1 trick)
     run_cmd("route", &["add", "-net", "0.0.0.0/1", "-interface", tun_name])?;
     run_cmd("route", &["add", "-net", "128.0.0.0/1", "-interface", tun_name])?;
+    info!("routes configured: all traffic → {tun_name}");
+    Ok(())
+}
 
+fn setup_routes_linux(tun_name: &str, server_ip: &str) -> Result<()> {
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .context("getting default gateway")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // "default via 172.31.1.1 dev eth0"
+    let gateway = stdout
+        .split_whitespace()
+        .skip_while(|w| *w != "via")
+        .nth(1)
+        .context("parsing default gateway")?
+        .to_string();
+
+    info!("original gateway: {gateway}");
+    run_cmd("ip", &["route", "add", server_ip, "via", &gateway])?;
+    run_cmd("ip", &["route", "add", "0.0.0.0/1", "dev", tun_name])?;
+    run_cmd("ip", &["route", "add", "128.0.0.0/1", "dev", tun_name])?;
     info!("routes configured: all traffic → {tun_name}");
     Ok(())
 }
 
 /// Clean up client-side routes
 pub fn teardown_client_routes(server_ip: &str) {
-    let _ = run_cmd("route", &["delete", "-net", "0.0.0.0/1"]);
-    let _ = run_cmd("route", &["delete", "-net", "128.0.0.0/1"]);
-    let _ = run_cmd("route", &["delete", "-host", server_ip]);
+    if cfg!(target_os = "macos") {
+        let _ = run_cmd("route", &["delete", "-net", "0.0.0.0/1"]);
+        let _ = run_cmd("route", &["delete", "-net", "128.0.0.0/1"]);
+        let _ = run_cmd("route", &["delete", "-host", server_ip]);
+    } else {
+        let _ = run_cmd("ip", &["route", "del", "0.0.0.0/1"]);
+        let _ = run_cmd("ip", &["route", "del", "128.0.0.0/1"]);
+        let _ = run_cmd("ip", &["route", "del", server_ip]);
+    }
     info!("routes cleaned up");
 }
 
 /// Set up server-side NAT: forward TUN traffic to the internet
 pub fn setup_server_nat(tun_name: &str, subnet: &str) -> Result<()> {
-    // Enable IP forwarding
+    if cfg!(target_os = "macos") {
+        setup_nat_macos(tun_name, subnet)
+    } else {
+        setup_nat_linux(tun_name, subnet)
+    }
+}
+
+fn setup_nat_linux(tun_name: &str, subnet: &str) -> Result<()> {
+    run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+
+    // Find default interface
+    let output = Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let iface = stdout
+        .split_whitespace()
+        .skip_while(|w| *w != "dev")
+        .nth(1)
+        .unwrap_or("eth0")
+        .to_string();
+
+    info!("NAT: {subnet} → {iface}");
+
+    run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", &iface, "-j", "MASQUERADE"])?;
+    run_cmd("iptables", &["-A", "FORWARD", "-i", tun_name, "-o", &iface, "-j", "ACCEPT"])?;
+    run_cmd("iptables", &["-A", "FORWARD", "-i", &iface, "-o", tun_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])?;
+
+    info!("NAT enabled (iptables)");
+    Ok(())
+}
+
+fn setup_nat_macos(tun_name: &str, subnet: &str) -> Result<()> {
     run_cmd("sysctl", &["-w", "net.inet.ip.forwarding=1"])?;
 
-    // Find the internet-facing interface
     let output = Command::new("route")
         .args(["-n", "get", "default"])
         .output()?;
@@ -111,14 +172,20 @@ pub fn setup_server_nat(tun_name: &str, subnet: &str) -> Result<()> {
     std::fs::write("/tmp/yuzu-pf.conf", &rules)?;
     run_cmd("pfctl", &["-f", "/tmp/yuzu-pf.conf", "-e"])?;
 
-    info!("NAT enabled");
+    info!("NAT enabled (pf)");
     Ok(())
 }
 
 /// Teardown server NAT
 pub fn teardown_server_nat() {
-    let _ = run_cmd("pfctl", &["-d"]);
-    let _ = std::fs::remove_file("/tmp/yuzu-pf.conf");
+    if cfg!(target_os = "macos") {
+        let _ = run_cmd("pfctl", &["-d"]);
+        let _ = std::fs::remove_file("/tmp/yuzu-pf.conf");
+    } else {
+        // Linux: flush iptables rules (simple cleanup)
+        let _ = run_cmd("iptables", &["-t", "nat", "-F"]);
+        let _ = run_cmd("iptables", &["-F", "FORWARD"]);
+    }
 }
 
 /// Relay packets between TUN device and a framed TLS stream

@@ -1,6 +1,7 @@
-use crate::{protocol, transport};
+use crate::{protocol, transport, tunnel};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,7 +18,6 @@ pub struct ServerConfig {
     pub camouflage: bool,
 }
 
-/// Cover page HTML
 fn cover_page(domain: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\n\
@@ -41,29 +41,39 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(&config.listen).await?;
     let cover = cover_page(&config.domain);
 
+    // Create server TUN device
+    let tun_cfg = tunnel::TunConfig::default();
+    let tun_dev = tunnel::create_device(&tun_cfg.server_ip, tun_cfg.prefix_len, tun_cfg.mtu)?;
+    let tun_name = tun_dev.name().unwrap_or_else(|_| "utun?".into());
+
+    // Set up NAT
+    let subnet = format!("{}/{}", tun_cfg.server_ip.rsplit_once('.').map(|(base, _)| format!("{base}.0")).unwrap_or("10.66.0.0".into()), tun_cfg.prefix_len);
+    tunnel::setup_server_nat(&tun_name, &subnet)?;
+
+    let tun_dev = Arc::new(tun_dev);
+
     info!("yuzu server listening on {}", config.listen);
     info!("  domain: {}", config.domain);
-    if let Some(ref ssh) = config.ssh_backend {
-        info!("  ssh: {ssh}");
-    }
-    if let Some(ref et) = config.et_backend {
-        info!("  et: {et}");
-    }
+    info!("  tun: {tun_name} ({})", tun_cfg.server_ip);
 
-    let ssh_backend = config.ssh_backend.clone();
-    let et_backend = config.et_backend.clone();
+    // Handle cleanup on shutdown
+    let subnet_cleanup = subnet.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tunnel::teardown_server_nat();
+        info!("server shutting down");
+        std::process::exit(0);
+    });
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let secret = secret.clone();
         let cover = cover.clone();
-        let ssh = ssh_backend.clone();
-        let et = et_backend.clone();
+        let tun = tun_dev.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &acceptor, &secret, &cover, &ssh, &et).await
-            {
+            if let Err(e) = handle_connection(stream, &acceptor, &secret, &cover, tun).await {
                 debug!("connection from {addr}: {e}");
             }
         });
@@ -75,18 +85,14 @@ async fn handle_connection(
     acceptor: &tokio_rustls::TlsAcceptor,
     secret: &[u8],
     cover: &str,
-    ssh_backend: &Option<String>,
-    et_backend: &Option<String>,
+    tun_dev: Arc<tun_rs::AsyncDevice>,
 ) -> Result<()> {
     let mut tls = acceptor.accept(stream).await.context("TLS handshake")?;
 
-    // Read secret (64 bytes)
+    // Read secret
     let mut buf = vec![0u8; protocol::SECRET_LEN];
-    match tokio::io::AsyncReadExt::read_exact(&mut tls, &mut buf).await {
-        Ok(_) => {}
-        Err(_) => {
-            return serve_cover(&mut tls, cover).await;
-        }
+    if tls.read_exact(&mut buf).await.is_err() {
+        return serve_cover(&mut tls, cover).await;
     }
 
     if !bool::from(buf.ct_eq(secret)) {
@@ -95,47 +101,41 @@ async fn handle_connection(
 
     debug!("client authenticated");
 
-    // Read first byte to detect protocol
-    let mut peek = [0u8; 1];
-    match tls.read_exact(&mut peek).await {
-        Ok(_) => {}
-        Err(_) => return Ok(()),
+    // Read mode byte
+    let mut mode = [0u8; 1];
+    if tls.read_exact(&mut mode).await.is_err() {
+        return Ok(());
     }
 
-    match peek[0] {
-        // SSH: starts with 'S' (SSH-2.0-...)
-        b'S' if ssh_backend.is_some() => {
-            let backend = ssh_backend.as_ref().unwrap();
-            debug!("detected SSH, proxying to {backend}");
-            let mut target = TcpStream::connect(backend).await?;
-            // Replay the 'S' byte
-            target.write_all(&peek).await?;
+    match mode[0] {
+        // TUN mode
+        tunnel::TUN_MARKER => {
+            info!("client entering TUN mode");
+            // Send server TUN IP config to client
+            let cfg = tunnel::TunConfig::default();
+            let config_msg = format!("{}\n{}\n{}\n", cfg.client_ip, cfg.server_ip, cfg.prefix_len);
+            tls.write_all(config_msg.as_bytes()).await?;
+            tls.flush().await?;
+
+            // Relay packets
+            tunnel::relay(tun_dev, tls).await?;
+        }
+        // SSH
+        b'S' => {
+            debug!("detected SSH");
+            let mut target = TcpStream::connect("127.0.0.1:22").await?;
+            target.write_all(&mode).await?;
             transport::relay(tls, target).await?;
         }
-
-        // ET: protobuf starts with 0x0a (field 1, wire type 2 = length-delimited string)
-        0x0a if et_backend.is_some() => {
-            let backend = et_backend.as_ref().unwrap();
-            debug!("detected ET, proxying to {backend}");
-            let mut target = TcpStream::connect(backend).await?;
-            target.write_all(&peek).await?;
+        // ET
+        0x0a => {
+            debug!("detected ET");
+            let mut target = TcpStream::connect("127.0.0.1:2022").await?;
+            target.write_all(&mode).await?;
             transport::relay(tls, target).await?;
         }
-
-        // TUN packet: our protocol — first byte is IP version (0x45 = IPv4, 0x60 = IPv6)
-        0x45 | 0x60 => {
-            debug!("TUN mode");
-            handle_tun(tls, peek[0]).await?;
-        }
-
-        // Framed TUN: length-prefixed packets (0x00 = our framing marker)
-        0x00 => {
-            debug!("framed TUN mode");
-            handle_framed_tun(tls).await?;
-        }
-
         other => {
-            warn!("unknown protocol byte after auth: {other:#04x}");
+            warn!("unknown mode byte: {other:#04x}");
         }
     }
 
@@ -146,31 +146,5 @@ async fn serve_cover<S: AsyncWriteExt + Unpin>(stream: &mut S, cover: &str) -> R
     debug!("serving cover page");
     stream.write_all(cover.as_bytes()).await.ok();
     stream.shutdown().await.ok();
-    Ok(())
-}
-
-/// Handle framed TUN packets: [len: u16be, packet: bytes]
-async fn handle_framed_tun<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut stream: S) -> Result<()> {
-    // TODO: create TUN device, forward packets
-    // For now, just read and discard
-    info!("TUN mode connected (not yet implemented)");
-    let mut buf = vec![0u8; 65536];
-    loop {
-        let len = match stream.read_u16().await {
-            Ok(l) => l as usize,
-            Err(_) => break,
-        };
-        if len == 0 || len > 65535 {
-            break;
-        }
-        stream.read_exact(&mut buf[..len]).await?;
-        // TODO: write to TUN device
-    }
-    Ok(())
-}
-
-/// Handle raw TUN packet (first byte already read)
-async fn handle_tun<S: AsyncReadExt + AsyncWriteExt + Unpin>(mut _stream: S, _first: u8) -> Result<()> {
-    info!("raw TUN mode (not yet implemented)");
     Ok(())
 }

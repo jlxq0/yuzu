@@ -1,24 +1,21 @@
-use crate::{camouflage, protocol, transport};
+use crate::{camouflage, protocol, transport, tunnel};
 use anyhow::{Context, Result};
 use rustls::pki_types::ServerName;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 /// Run the client: create TUN, route all traffic through TLS tunnel
-pub async fn run(
-    server: &str,
-    secret_path: &Path,
-    enable_camouflage: bool,
-) -> Result<()> {
+pub async fn run(server: &str, secret_path: &Path, enable_camouflage: bool) -> Result<()> {
     let secret = protocol::load_secret(secret_path)?;
     let connector = transport::tls_connector()?;
     let (host, port) = parse_server(server)?;
 
     info!("connecting to {host}:{port}");
 
-    // Connect to server via TLS
+    // Connect via TLS
     let tcp = TcpStream::connect(format!("{host}:{port}"))
         .await
         .context("connecting to server")?;
@@ -29,14 +26,50 @@ pub async fn run(
         .await
         .context("TLS handshake")?;
 
-    // Send secret
+    // Authenticate
     tls.write_all(&secret).await?;
 
-    // Send framing marker (0x00 = framed TUN mode)
-    tls.write_u8(0x00).await?;
+    // Request TUN mode
+    tls.write_u8(tunnel::TUN_MARKER).await?;
     tls.flush().await?;
 
-    info!("authenticated, entering TUN mode");
+    // Read TUN config from server
+    let mut reader = BufReader::new(tls);
+    let mut client_ip = String::new();
+    let mut server_ip = String::new();
+    let mut prefix_str = String::new();
+    reader.read_line(&mut client_ip).await?;
+    reader.read_line(&mut server_ip).await?;
+    reader.read_line(&mut prefix_str).await?;
+    let client_ip = client_ip.trim().to_string();
+    let server_ip = server_ip.trim().to_string();
+    let prefix_len: u8 = prefix_str.trim().parse().unwrap_or(24);
+
+    info!("TUN config: client={client_ip}, server={server_ip}/{prefix_len}");
+
+    // Unwrap the BufReader to get the stream back
+    let tls = reader.into_inner();
+
+    // Create TUN device
+    let dev = tunnel::create_device(&client_ip, prefix_len, 1400)?;
+    let tun_name = dev.name().unwrap_or_else(|_| "utun?".into());
+    let dev = Arc::new(dev);
+
+    // Resolve server IP for route exclusion
+    let server_addr = dns_resolve(&host).await?;
+    info!("server resolved to {server_addr}");
+
+    // Set up routes
+    tunnel::setup_client_routes(&tun_name, &server_addr)?;
+
+    // Handle cleanup on shutdown
+    let server_addr_cleanup = server_addr.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        tunnel::teardown_client_routes(&server_addr_cleanup);
+        info!("client shutting down");
+        std::process::exit(0);
+    });
 
     if enable_camouflage {
         let h = host.clone();
@@ -45,13 +78,13 @@ pub async fn run(
         });
     }
 
-    // TODO: create TUN device, set up routes, relay packets
-    // For now, demonstrate the connection works
-    info!("TUN mode connected (not yet implemented)");
-    info!("press Ctrl+C to exit");
+    info!("tunnel active — all traffic routed through {tun_name}");
 
-    // Keep connection alive
-    tokio::signal::ctrl_c().await?;
+    // Relay packets between TUN and TLS
+    tunnel::relay(dev, tls).await?;
+
+    // If relay ends, clean up
+    tunnel::teardown_client_routes(&server_addr);
 
     Ok(())
 }
@@ -64,4 +97,14 @@ fn parse_server(server: &str) -> Result<(String, u16)> {
     } else {
         Ok((server.to_string(), 443))
     }
+}
+
+/// Resolve hostname to IP (needed for route exclusion)
+async fn dns_resolve(host: &str) -> Result<String> {
+    use tokio::net::lookup_host;
+    let addr = lookup_host(format!("{host}:0"))
+        .await?
+        .next()
+        .context("DNS resolution failed")?;
+    Ok(addr.ip().to_string())
 }

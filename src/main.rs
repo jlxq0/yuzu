@@ -9,6 +9,7 @@ mod client;
 mod protocol;
 mod server;
 mod transport;
+mod tunnel;
 
 #[derive(Parser)]
 #[command(name = "yuzu", version, about = "Anti-censorship tunnel. All traffic over TLS on 443.")]

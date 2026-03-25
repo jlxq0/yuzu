@@ -157,9 +157,10 @@ fn setup_nat_linux(tun_name: &str, subnet: &str) -> Result<()> {
 
     info!("NAT: {subnet} → {iface}");
 
-    run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", &iface, "-j", "MASQUERADE"])?;
+    // NAT all traffic from TUN interface (not just subnet — client may send with original source IP)
+    run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-o", &iface, "-j", "MASQUERADE"])?;
     run_cmd("iptables", &["-A", "FORWARD", "-i", tun_name, "-o", &iface, "-j", "ACCEPT"])?;
-    run_cmd("iptables", &["-A", "FORWARD", "-i", &iface, "-o", tun_name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])?;
+    run_cmd("iptables", &["-A", "FORWARD", "-i", &iface, "-o", tun_name, "-j", "ACCEPT"])?;
 
     info!("NAT enabled (iptables)");
     Ok(())
@@ -182,7 +183,7 @@ fn setup_nat_macos(tun_name: &str, subnet: &str) -> Result<()> {
     info!("NAT: {subnet} → {iface}");
 
     let rules = format!(
-        "nat on {iface} from {subnet} to any -> ({iface})\npass on {tun_name} all\n"
+        "nat on {iface} from any to any -> ({iface})\npass on {tun_name} all\n"
     );
     std::fs::write("/tmp/yuzu-pf.conf", &rules)?;
     run_cmd("pfctl", &["-f", "/tmp/yuzu-pf.conf", "-e"])?;

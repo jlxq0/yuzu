@@ -263,6 +263,11 @@ async fn handle_connection(
 }
 
 async fn serve_cover<S: AsyncWriteExt + Unpin>(stream: &mut S, cover: &str) -> Result<()> {
+    // Add random delay (50-200ms) to prevent timing analysis
+    use rand::Rng;
+    let delay = rand::rng().random_range(50..200);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+
     stream.write_all(cover.as_bytes()).await.ok();
     stream.shutdown().await.ok();
     Ok(())

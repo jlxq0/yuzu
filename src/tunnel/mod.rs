@@ -6,8 +6,6 @@ use tracing::{debug, error, info};
 
 /// TUN tunnel configuration
 pub struct TunConfig {
-    /// Client-side TUN IP
-    pub client_ip: String,
     /// Server-side TUN IP
     pub server_ip: String,
     /// Subnet prefix length
@@ -19,7 +17,6 @@ pub struct TunConfig {
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
-            client_ip: "10.66.0.2".into(),
             server_ip: "10.66.0.1".into(),
             prefix_len: 24,
             mtu: 1400,
@@ -29,6 +26,29 @@ impl Default for TunConfig {
 
 /// Frame marker sent after secret to indicate TUN mode
 pub const TUN_MARKER: u8 = 0x00;
+
+/// Allocates unique client IPs from the 10.66.0.0/24 pool
+pub struct IpAllocator {
+    next: std::sync::atomic::AtomicU8,
+}
+
+impl IpAllocator {
+    pub fn new() -> Self {
+        Self {
+            next: std::sync::atomic::AtomicU8::new(2), // .1 is server, start at .2
+        }
+    }
+
+    /// Allocate next client IP. Returns None if pool exhausted (max 253 clients).
+    pub fn allocate(&self) -> Option<String> {
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < 255 {
+            Some(format!("10.66.0.{n}"))
+        } else {
+            None
+        }
+    }
+}
 
 /// Create a TUN device and return it
 pub fn create_device(ip: &str, prefix_len: u8, mtu: u16) -> Result<tun_rs::AsyncDevice> {
@@ -213,21 +233,51 @@ pub fn teardown_server_nat() {
 
 /// Override DNS to use public resolvers (traffic goes through tunnel)
 pub fn setup_client_dns() -> Result<()> {
-    if cfg!(target_os = "linux") {
-        // Back up existing resolv.conf
+    if cfg!(target_os = "macos") {
+        // Back up current DNS config
+        let output = Command::new("networksetup")
+            .args(["-getdnsservers", "Wi-Fi"])
+            .output()?;
+        let current = String::from_utf8_lossy(&output.stdout);
+        std::fs::write("/tmp/yuzu-dns-backup.txt", current.as_ref())?;
+
+        // Set DNS to public resolvers (traffic goes through tunnel)
+        let _ = run_cmd("networksetup", &["-setdnsservers", "Wi-Fi", "8.8.8.8", "1.1.1.1"]);
+        // Also try for Ethernet
+        let _ = run_cmd("networksetup", &["-setdnsservers", "Ethernet", "8.8.8.8", "1.1.1.1"]);
+        // Flush DNS cache
+        let _ = run_cmd("dscacheutil", &["-flushcache"]);
+        let _ = run_cmd("killall", &["-HUP", "mDNSResponder"]);
+        info!("DNS set to 8.8.8.8 / 1.1.1.1 (macOS)");
+    } else {
+        // Linux
         let _ = std::fs::copy("/etc/resolv.conf", "/tmp/yuzu-resolv.conf.bak");
         std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")?;
-        info!("DNS set to 8.8.8.8 / 1.1.1.1 (through tunnel)");
+        info!("DNS set to 8.8.8.8 / 1.1.1.1 (Linux)");
     }
-    // macOS: DNS is handled by scutil, more complex — skip for now
     Ok(())
 }
 
 /// Restore original DNS
 pub fn teardown_client_dns() {
-    if cfg!(target_os = "linux") {
-        if let Ok(_) = std::fs::copy("/tmp/yuzu-resolv.conf.bak", "/etc/resolv.conf") {
-            info!("DNS restored");
+    if cfg!(target_os = "macos") {
+        if let Ok(backup) = std::fs::read_to_string("/tmp/yuzu-dns-backup.txt") {
+            let servers: Vec<&str> = backup.trim().lines().collect();
+            if servers.is_empty() || servers[0].contains("any DNS") {
+                // Was "empty" (DHCP default)
+                let _ = run_cmd("networksetup", &["-setdnsservers", "Wi-Fi", "empty"]);
+                let _ = run_cmd("networksetup", &["-setdnsservers", "Ethernet", "empty"]);
+            } else {
+                let mut args = vec!["-setdnsservers", "Wi-Fi"];
+                args.extend(servers.iter().copied());
+                let _ = run_cmd("networksetup", &args);
+            }
+            let _ = run_cmd("dscacheutil", &["-flushcache"]);
+            info!("DNS restored (macOS)");
+        }
+    } else {
+        if std::fs::copy("/tmp/yuzu-resolv.conf.bak", "/etc/resolv.conf").is_ok() {
+            info!("DNS restored (Linux)");
         }
     }
 }

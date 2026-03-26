@@ -1,15 +1,64 @@
 use crate::{protocol, tunnel};
 use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info};
 
 /// Maximum concurrent connections
 const MAX_CONNECTIONS: usize = 64;
+/// Maximum failed auth attempts per IP before ban
+const MAX_FAILURES_PER_IP: usize = 5;
+/// Ban duration after too many failures
+const BAN_DURATION: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Per-IP rate limiter
+struct RateLimiter {
+    failures: HashMap<IpAddr, (usize, Instant)>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            failures: HashMap::new(),
+        }
+    }
+
+    fn is_banned(&self, ip: &IpAddr) -> bool {
+        if let Some((count, last)) = self.failures.get(ip) {
+            *count >= MAX_FAILURES_PER_IP && last.elapsed() < BAN_DURATION
+        } else {
+            false
+        }
+    }
+
+    fn record_failure(&mut self, ip: IpAddr) {
+        let entry = self.failures.entry(ip).or_insert((0, Instant::now()));
+        // Reset if ban has expired
+        if entry.1.elapsed() >= BAN_DURATION {
+            *entry = (1, Instant::now());
+        } else {
+            entry.0 += 1;
+            entry.1 = Instant::now();
+        }
+    }
+
+    fn record_success(&mut self, ip: &IpAddr) {
+        self.failures.remove(ip);
+    }
+
+    /// Clean up old entries periodically
+    fn cleanup(&mut self) {
+        self.failures
+            .retain(|_, (_, last)| last.elapsed() < BAN_DURATION * 2);
+    }
+}
 
 pub struct ServerConfig {
     pub listen: String,
@@ -69,6 +118,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     tunnel::setup_server_nat(&tun_name, &subnet)?;
 
     let tun_dev = Arc::new(tun_dev);
+    let ip_alloc = Arc::new(tunnel::IpAllocator::new());
 
     info!("yuzu server listening on {}", config.listen);
     info!("  domain: {}", config.domain);
@@ -83,8 +133,27 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         std::process::exit(0);
     });
 
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+
+    // Periodic cleanup of rate limiter
+    let rl_cleanup = rate_limiter.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            rl_cleanup.lock().await.cleanup();
+        }
+    });
+
     loop {
         let (stream, addr) = listener.accept().await?;
+        let ip = addr.ip();
+
+        // Check rate limit
+        if rate_limiter.lock().await.is_banned(&ip) {
+            debug!("{addr}: rate limited, dropping");
+            drop(stream);
+            continue;
+        }
 
         // Connection limit
         let permit = match semaphore.clone().try_acquire_owned() {
@@ -100,24 +169,33 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         let secret = secret.clone();
         let cover = cover.clone();
         let tun = tun_dev.clone();
+        let rl = rate_limiter.clone();
+        let alloc = ip_alloc.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &acceptor, &secret, &cover, tun).await {
-                debug!("{addr}: {e}");
+            let authenticated = handle_connection(stream, &acceptor, &secret, &cover, tun, &alloc).await;
+            match authenticated {
+                Ok(true) => rl.lock().await.record_success(&ip),
+                Ok(false) => rl.lock().await.record_failure(ip),
+                Err(e) => {
+                    debug!("{addr}: {e}");
+                    rl.lock().await.record_failure(ip);
+                }
             }
-            drop(permit); // release connection slot
+            drop(permit);
         });
     }
 }
 
+/// Returns Ok(true) if client authenticated, Ok(false) if auth failed
 async fn handle_connection(
     stream: TcpStream,
     acceptor: &tokio_rustls::TlsAcceptor,
     secret: &[u8],
     cover: &str,
     tun_dev: Arc<tun_rs::AsyncDevice>,
-) -> Result<()> {
-    // Set a read timeout for the auth phase to prevent slowloris
+    ip_alloc: &tunnel::IpAllocator,
+) -> Result<bool> {
     let mut tls = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         acceptor.accept(stream),
@@ -135,29 +213,39 @@ async fn handle_connection(
     .await
     {
         Ok(Ok(_)) => {}
-        _ => return serve_cover(&mut tls, cover).await,
+        _ => {
+            serve_cover(&mut tls, cover).await?;
+            return Ok(false);
+        }
     }
 
     if !bool::from(buf.ct_eq(secret)) {
-        return serve_cover(&mut tls, cover).await;
+        serve_cover(&mut tls, cover).await?;
+        return Ok(false);
     }
 
     // Read mode byte
     let mut mode = [0u8; 1];
     if tls.read_exact(&mut mode).await.is_err() {
-        return Ok(());
+        return Ok(false);
     }
 
     if mode[0] != tunnel::TUN_MARKER {
-        return serve_cover(&mut tls, cover).await;
+        serve_cover(&mut tls, cover).await?;
+        return Ok(false);
     }
 
     debug!("client authenticated, entering TUN mode");
 
-    // Send TUN config
+    // Allocate client IP
+    let client_ip = ip_alloc
+        .allocate()
+        .context("IP pool exhausted")?;
+    debug!("assigned client IP: {client_ip}");
+
     let cfg = tunnel::TunConfig::default();
     let mut config_buf = [0u8; 32];
-    let client_bytes = cfg.client_ip.as_bytes();
+    let client_bytes = client_ip.as_bytes();
     let server_bytes = cfg.server_ip.as_bytes();
     config_buf[..client_bytes.len()].copy_from_slice(client_bytes);
     config_buf[16..16 + server_bytes.len()].copy_from_slice(server_bytes);
@@ -166,12 +254,12 @@ async fn handle_connection(
 
     // Ensure route to client IP
     let tun_name = tun_dev.name().unwrap_or_else(|_| "tun0".into());
-    tunnel::setup_server_tun_route(&tun_name, &cfg.client_ip)?;
+    tunnel::setup_server_tun_route(&tun_name, &client_ip)?;
 
     // Relay packets
     tunnel::relay(tun_dev, tls).await?;
 
-    Ok(())
+    Ok(true)
 }
 
 async fn serve_cover<S: AsyncWriteExt + Unpin>(stream: &mut S, cover: &str) -> Result<()> {
